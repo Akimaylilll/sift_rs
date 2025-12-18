@@ -1,0 +1,13 @@
+[package]
+name = "sift-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = "0.25.5"
+nalgebra = "0.33.2"
+ndarray = "0.16.1"
+
+[[example]]
+name = "test"
+path = "examples/test.rs"
