@@ -287,14 +287,7 @@ fn refine_extremum(
                 }
 
                 // 计算在极值点的函数值（使用完整的二阶泰勒展开）
-                let dx_val = current[[y_int, x_int + 1]] - current[[y_int, x_int - 1]];
-                let dy_val = current[[y_int + 1, x_int]] - current[[y_int - 1, x_int]];
-                let ds_val = next[[y_int, x_int]] - prev[[y_int, x_int]];
-                
-                let d_vector = Vector3::new(dx_val, dy_val, ds_val);
-                let offset_vector = Vector3::new(offset[0], offset[1], offset[2]);
-                
-                let dog_value = current[[y_int, x_int]] + 0.5 * d_vector.dot(&offset_vector);
+                let dog_value = current[[y_int, x_int]] + 0.5 * grad.dot(&offset);
                 
                 // 返回相对于当前点的偏移量
                 return Some((delta[0], delta[1], delta[2], dog_value));
