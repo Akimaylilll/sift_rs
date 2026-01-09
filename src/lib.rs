@@ -6,6 +6,7 @@
 pub mod detector;
 pub mod descriptor;
 pub mod keypoint;
+pub mod gaussian_blur;
 
 pub use detector::SiftDetector;
 pub use descriptor::SiftDescriptor;

@@ -1,17 +1,17 @@
 use crate::keypoint::KeyPoint;
 use nalgebra::{Matrix3, Vector3, LU};
-use ndarray::{Array3, Axis};
+use ndarray::{Array2, Array3, Axis};
+use image::DynamicImage;
+use crate::gaussian_blur::GaussianFilter;
 
 const CONTRAST_THRESHOLD: f32 = 0.03;
 const CURVATURE_THRESHOLD: f32 = 10.0;
-const INITIAL_SIGMA: f32 = 1.6;
-const SCALES_PER_OCTAVE: usize = 5;
 
 /// SIFT detector for finding keypoints in images
 pub struct SiftDetector {
     pub scale_spaces: Vec<ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 3]>>>,
-    num_octaves: usize,
     num_scales: usize,
+    num_octaves: usize,
     sigma: f32,
 }
 
@@ -19,58 +19,54 @@ impl SiftDetector {
     pub fn new() -> Self {
         SiftDetector {
             scale_spaces: Vec::new(),
-            num_octaves: 4,
-            num_scales: 5,
+            num_scales: 3,
+            num_octaves: 0, // 初始化为0，在检测时重新计算
             sigma: 1.6,
         }
     }
-    pub fn detect(&mut self, image: image::ImageBuffer<image::Luma<u8>, Vec<u8>>) -> Vec<KeyPoint> {
-        // let mut scale_spaces: Vec<
-        //     ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 3]>>,
-        // > = Vec::new();
+    pub fn detect(&mut self, image: image::DynamicImage) -> Vec<KeyPoint> {
+        let image = self.dynamic_image_to_ndarray(&image);
         let mut dog_pyramids: Vec<
             ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 3]>>,
         > = Vec::new();
-        let mut img_first = image.clone();
+        let (image_width, image_height) = (image.shape()[1], image.shape()[0]);
+        // 计算八度数
+        let mut image_size = image_width.min(image_height);
+        let mut num_octaves = 0;
+        while image_size >= 8 { // 至少需要8x8的图像来检测关键点
+            num_octaves += 1;
+            image_size /= 2;
+        }
+        self.num_octaves = num_octaves;
+        let n_dog = self.num_scales + 2; // DOG金字塔层数
+        let n_g = self.num_scales + 3;   // 高斯金字塔层数
+        self.num_scales = n_g;
+
+        let mut current_img = image.clone();
         for octave in 0..self.num_octaves {
-            let mut n_width;
-            let mut n_height;
-            (n_width, n_height) = img_first.dimensions();
-            if (octave > 0) {
-                let ii = self.scale_spaces[octave - 1].index_axis(Axis(0), 2);
-                let img_temp =
-                    image::ImageBuffer::from_fn(n_width as u32, n_height as u32, |x, y| {
-                        let val = (ii[[y as usize, x as usize]].clamp(0.0, 1.0) * 255.0) as u8;
-                        image::Luma::<u8>([val])
-                    });
-                let (w, h) = img_temp.dimensions();
-                img_first = image::imageops::resize(
-                    &img_temp,
-                    w / 2,
-                    h / 2,
-                    image::imageops::FilterType::Nearest,
-                );
-                (n_width, n_height) = img_first.dimensions();
-            }
-            print!(
-                "Image resized successfully. New width: {}, New height: {}\n",
-                n_width, n_height
-            );
+            let (w, h) = if octave == 0 {
+                (image_width, image_height)
+            } else {
+                (current_img.shape()[1], current_img.shape()[0])
+            };
             let mut gaussian_pyramid =
-                Array3::<f32>::zeros((self.num_scales, n_height as usize, n_width as usize));
+                Array3::<f32>::zeros((self.num_scales, h as usize, w as usize));
             for scale in 0..self.num_scales {
-                let k = self.sigma
-                    * 2.0_f32.powf(octave as f32 + scale as f32 / self.num_scales as f32);
-                print!("Building Gaussian pyramid for scale {}, k {}\n", scale, k);
-                let kernel_size = (6.0 * k) as u32;
-                let blurred_img = image::imageops::blur(&img_first, kernel_size as f32);
-                for (x, y, pixel) in blurred_img.enumerate_pixels() {
-                    gaussian_pyramid[(scale, y as usize, x as usize)] = pixel[0] as f32;
-                }
+                // 计算每个尺度下的sigma值
+                let base_sigma = if octave == 0 {
+                    // 第一个八度的初始sigma值
+                    2.0_f32.powf(scale as f32 / self.num_scales as f32)
+                } else {
+                    2.0_f32.powf(octave as f32 + scale as f32 / self.num_scales as f32)
+                };
+                
+                let sigma = self.sigma * base_sigma;
+                let blurred_img = GaussianFilter::apply_to_array_view(current_img.view(), sigma as f64);
+                gaussian_pyramid.slice_mut(ndarray::s![scale, .., ..]).assign(&blurred_img);
             }
             // println!("{:?}", gaussian_pyramid);
             let mut dog_pyramid =
-                Array3::<f32>::zeros((self.num_scales - 1, n_height as usize, n_width as usize));
+                Array3::<f32>::zeros((n_dog, h as usize, w as usize)); // DOG金字塔有n_dog层
             for scale in 1..self.num_scales {
                 let a_channel = gaussian_pyramid.index_axis(Axis(0), scale);
                 let b_channel = gaussian_pyramid.index_axis(Axis(0), scale - 1);
@@ -79,15 +75,16 @@ impl SiftDetector {
             }
             self.scale_spaces.push(gaussian_pyramid);
             dog_pyramids.push(dog_pyramid);
+            
+            // 缩放到下一个八度
+            if octave < self.num_octaves - 1 {
+                current_img = self.scale_spaces[octave].index_axis(Axis(0), self.num_scales - n_dog).to_owned();
+                current_img = self.resize_nearest_grayscale_simple(&current_img, h / 2, w / 2);
+            }
         }
-        // println!("{:?}", v);
-        let mut keypoints = Vec::new();
+        let mut keypoints: Vec<KeyPoint> = Vec::new();
         for (octave, dog_pyramid) in dog_pyramids.iter().enumerate() {
-            let (scales, w, h) = dog_pyramid.dim();
-            println!(
-                "Octave {}, width {}, height {}, depth {}",
-                octave, scales, w, h
-            );
+            let (scales, _w, _h) = dog_pyramid.dim();
             for scale in 1..scales - 1 {
                 let prev = dog_pyramid.index_axis(Axis(0), scale - 1);
                 let current = dog_pyramid.index_axis(Axis(0), scale);
@@ -95,11 +92,14 @@ impl SiftDetector {
                 for y in 1..current.shape()[0] - 1 {
                     for x in 1..current.shape()[1] - 1 {
                         let center = current[[y, x]];
-                        if self.is_extremum(prev, current, next, x, y, center) {
-                            if let Some((dx, dy, ds, value)) =
-                                self.refine_extremum(prev, current, next, x, y)
+                        if self.is_extremum(prev, current, next, x, y, center, CONTRAST_THRESHOLD) {
+                            if let Some((dx, dy, _ds, value)) =
+                                self.refine_extremum(prev, current, next, x, y, scale)
                             {
-                                // println!("Extremum found at dx {}, dy {}, ds {}, value {}", dx, dy, ds, value);
+                                // 检查偏移量是否过大（表示插值不可靠）
+                                if dx.abs() >= 1.0 || dy.abs() >= 1.0 || _ds.abs() >= 1.0 {
+                                    continue; // 偏移量过大，跳过这个点
+                                }
                                 if value.abs() < CONTRAST_THRESHOLD {
                                     continue;
                                 }
@@ -109,16 +109,11 @@ impl SiftDetector {
                                     continue;
                                 }
 
-                                let scale = INITIAL_SIGMA
-                                    * 2f32.powf(
-                                        (octave as f32
-                                            + (scale as f32 + ds) / SCALES_PER_OCTAVE as f32),
-                                    );
-
                                 keypoints.push(KeyPoint {
                                     x: (x as f32 + dx) * (1 << octave) as f32,
                                     y: (y as f32 + dy) * (1 << octave) as f32,
-                                    scale,
+                                    // 正确计算实际尺度
+                                    scale: 2.0_f32.powf(octave as f32 + (scale as f32 + _ds) / self.num_scales as f32) * self.sigma,
                                     octave,
                                     orientation: 0.0, // 后续计算方向
                                     descriptor: Vec::new(),
@@ -140,138 +135,172 @@ impl SiftDetector {
         x: usize,
         y: usize,
         center: f32,
+        threshold: f32
     ) -> bool {
-        // 检查当前层
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                if current[[(y as isize + dy) as usize, (x as isize + dx) as usize]] > center {
-                    return false;
+        if center.abs() < threshold {
+            return false;
+        }
+
+        let mut is_local_maximum = true;
+        let mut is_local_minimum = true;
+
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let (dx, dy, dz) = (dx as isize, dy as isize, dz as isize);
+                    let (current_x, current_y) = (x as isize, y as isize);
+                    
+                    if dz == -1 {
+                        // 检查prev层
+                        if dx == 0 && dy == 0 && dz == 0 {
+                            continue; // 跳过中心点
+                        }
+                        
+                        let check_x = (current_x + dx) as usize;
+                        let check_y = (current_y + dy) as usize;
+                        
+                        // 检查边界
+                        if check_x >= prev.shape()[1] || check_y >= prev.shape()[0] {
+                            continue;
+                        }
+                        
+                        if prev[[check_y, check_x]] >= center {
+                            is_local_maximum = false;
+                        } else if prev[[check_y, check_x]] <= center {
+                            is_local_minimum = false;
+                        }
+                    } else if dz == 0 {
+                        // 检查current层
+                        if dx == 0 && dy == 0 && dz == 0 {
+                            continue; // 跳过中心点
+                        }
+                        
+                        let check_x = (current_x + dx) as usize;
+                        let check_y = (current_y + dy) as usize;
+                        
+                        // 检查边界
+                        if check_x >= current.shape()[1] || check_y >= current.shape()[0] {
+                            continue;
+                        }
+                        
+                        if current[[check_y, check_x]] >= center {
+                            is_local_maximum = false;
+                        } else if current[[check_y, check_x]] <= center {
+                            is_local_minimum = false;
+                        }
+                    } else if dz == 1 {
+                        // 检查next层
+                        let check_x = (current_x + dx) as usize;
+                        let check_y = (current_y + dy) as usize;
+                        
+                        // 检查边界
+                        if check_x >= next.shape()[1] || check_y >= next.shape()[0] {
+                            continue;
+                        }
+                        
+                        if next[[check_y, check_x]] >= center {
+                            is_local_maximum = false;
+                        } else if next[[check_y, check_x]] <= center {
+                            is_local_minimum = false;
+                        }
+                    }
                 }
             }
         }
-
-        // // 检查上层和下层
-        // for dz in -1..=1 {
-        //     let layer = if dz == -1 { prev } else if dz == 0 { current } else { next };
-        //     for dy in -1..=1 {
-        //         for dx in -1..=1 {
-        //             if layer[[(y as isize + dy) as usize, (x as isize + dx) as usize]] > center {
-        //                 return false;
-        //             }
-        //         }
-        //     }
-        // }
-        true
+        
+        is_local_maximum || is_local_minimum
     }
 
-    fn refine_extremum(
+fn refine_extremum(
         &self,
         prev: ndarray::ArrayBase<ndarray::ViewRepr<&f32>, ndarray::Dim<[usize; 2]>>,
         current: ndarray::ArrayBase<ndarray::ViewRepr<&f32>, ndarray::Dim<[usize; 2]>>,
         next: ndarray::ArrayBase<ndarray::ViewRepr<&f32>, ndarray::Dim<[usize; 2]>>,
         x: usize,
         y: usize,
+        scale: usize
     ) -> Option<(f32, f32, f32, f32)> {
         const MAX_ITER: usize = 5;
-        const CONVERGE_THRESH: f32 = 0.01;
-        const MAX_SHIFT: f32 = 0.6;
+        const CONVERGE_THRESH: f32 = 0.5;
 
-        let mut xi = Vector3::new(0., 0., 0.); // 偏移量 (dx, dy, ds)
-        let mut iter = 0;
+        let mut offset = Vector3::new(0., 0., 0.);
         let (width, height) = (current.shape()[1], current.shape()[0]);
+        let dog_scales = self.num_scales - 3;
 
-        // 获取三维邻域数据（当前点周围3x3x3立方体）
-        let mut samples = Array3::<f32>::zeros((3, 3, 3));
-        let mut grad = Vector3::new(0., 0., 0.);
-        loop {
-            // 检查边界
-            if x as f32 + xi[0] < 0.
-                || x as f32 + xi[0] >= width as f32
-                || y as f32 + xi[1] < 0.
-                || y as f32 + xi[1] >= height as f32
-            {
+        let mut x_float = x as f32;
+        let mut y_float = y as f32;
+        let mut s_float = scale as f32;
+
+        for _iter in 0..MAX_ITER {
+            let x_int = x_float as usize;
+            let y_int = y_float as usize;
+            let s_int = s_float as usize;
+
+            // 检查边界 - DOG金字塔的边界检查
+            if x_int < 1 || x_int >= width - 1 || y_int < 1 || y_int >= height - 1 || 
+               s_int < 1 || s_int >= dog_scales - 1 {
                 return None;
             }
-            samples[[0, 0, 0]] = prev[[x - 1, y - 1]];
-            samples[[0, 1, 0]] = prev[[x - 1, y]];
-            samples[[0, 2, 0]] = prev[[x - 1, y + 1]];
-            samples[[1, 0, 0]] = prev[[x, y - 1]];
-            samples[[1, 1, 0]] = prev[[x, y]];
-            samples[[1, 2, 0]] = prev[[x, y + 1]];
-            samples[[2, 0, 0]] = prev[[x + 1, y - 1]];
-            samples[[2, 1, 0]] = prev[[x + 1, y]];
-            samples[[2, 2, 0]] = prev[[x + 1, y + 1]];
-
-            samples[[0, 0, 1]] = current[[x - 1, y - 1]];
-            samples[[0, 1, 1]] = current[[x - 1, y]];
-            samples[[0, 2, 1]] = current[[x - 1, y + 1]];
-            samples[[1, 0, 1]] = current[[x, y - 1]];
-            samples[[1, 1, 1]] = current[[x, y]];
-            samples[[1, 2, 1]] = current[[x, y + 1]];
-            samples[[2, 0, 1]] = current[[x + 1, y - 1]];
-            samples[[2, 1, 1]] = current[[x + 1, y]];
-            samples[[2, 2, 1]] = current[[x + 1, y + 1]];
-
-            samples[[0, 0, 2]] = next[[x - 1, y - 1]];
-            samples[[0, 1, 2]] = next[[x - 1, y]];
-            samples[[0, 2, 2]] = next[[x - 1, y + 1]];
-            samples[[1, 0, 2]] = next[[x, y - 1]];
-            samples[[1, 1, 2]] = next[[x, y]];
-            samples[[1, 2, 2]] = next[[x, y + 1]];
-            samples[[2, 0, 2]] = next[[x + 1, y - 1]];
-            samples[[2, 1, 2]] = next[[x + 1, y]];
-            samples[[2, 2, 2]] = next[[x + 1, y + 1]];
 
             // 计算一阶导数（梯度）
-            let dx = (samples[[1, 1, 2]] - samples[[1, 1, 0]]) / 2.0;
-            let dy = (samples[[1, 2, 1]] - samples[[1, 0, 1]]) / 2.0;
-            let ds = (samples[[2, 1, 1]] - samples[[0, 1, 1]]) / 2.0;
-
-            grad[0] = dx;
-            grad[1] = dy;
-            grad[2] = ds;
+            let dx = (current[[y_int, x_int + 1]] - current[[y_int, x_int - 1]]) * 0.5;
+            let dy = (current[[y_int + 1, x_int]] - current[[y_int - 1, x_int]]) * 0.5;
+            let ds = (next[[y_int, x_int]] - prev[[y_int, x_int]]) * 0.5;
 
             // 计算二阶导数（Hessian矩阵）
-            let dxx = samples[[1, 1, 2]] - 2.0 * samples[[1, 1, 1]] + samples[[1, 1, 0]];
-            let dyy = samples[[1, 2, 1]] - 2.0 * samples[[1, 1, 1]] + samples[[1, 0, 1]];
-            let dss = samples[[2, 1, 1]] - 2.0 * samples[[1, 1, 1]] + samples[[0, 1, 1]];
-            let dxy = (samples[[1, 2, 2]] - samples[[1, 2, 0]] - samples[[1, 0, 2]]
-                + samples[[1, 0, 0]])
-                / 4.0;
-            let dxs = (samples[[2, 1, 2]] - samples[[2, 1, 0]] - samples[[0, 1, 2]]
-                + samples[[0, 1, 0]])
-                / 4.0;
-            let dys = (samples[[2, 2, 1]] - samples[[2, 0, 1]] - samples[[0, 2, 1]]
-                + samples[[0, 0, 1]])
-                / 4.0;
+            let dxx = current[[y_int, x_int + 1]] - 2.0 * current[[y_int, x_int]] + current[[y_int, x_int - 1]];
+            let dyy = current[[y_int + 1, x_int]] - 2.0 * current[[y_int, x_int]] + current[[y_int - 1, x_int]];
+            let dss = next[[y_int, x_int]] - 2.0 * current[[y_int, x_int]] + prev[[y_int, x_int]];
+
+            let dxy = (current[[y_int + 1, x_int + 1]] - current[[y_int + 1, x_int - 1]] - 
+                      current[[y_int - 1, x_int + 1]] + current[[y_int - 1, x_int - 1]]) * 0.25;
+            let dxs = (next[[y_int, x_int + 1]] - next[[y_int, x_int - 1]] - 
+                      prev[[y_int, x_int + 1]] + prev[[y_int, x_int - 1]]) * 0.25;
+            let dys = (next[[y_int + 1, x_int]] - next[[y_int - 1, x_int]] - 
+                      prev[[y_int + 1, x_int]] + prev[[y_int - 1, x_int]]) * 0.25;
 
             let hessian = Matrix3::new(dxx, dxy, dxs, dxy, dyy, dys, dxs, dys, dss);
 
-            // 解线性方程：Hessian * x = -grad
             let lu = LU::new(hessian);
             if lu.determinant().abs() < 1e-6 {
                 return None; // Hessian不可逆
             }
+            
+            let grad = Vector3::new(dx, dy, ds);
             let delta = lu.solve(&(-grad)).unwrap();
-
+            
             // 更新偏移量
-            xi += delta;
+            offset += delta;
+
+            // 更新坐标
+            x_float += delta[0];
+            y_float += delta[1];
+            s_float += delta[2];
 
             // 收敛判断
-            if delta.norm() < CONVERGE_THRESH || iter >= MAX_ITER {
-                break;
+            if delta.norm() < CONVERGE_THRESH {
+                // 检查最终位置是否在边界内
+                if x_float < 0.0 || x_float >= (width as f32) || 
+                   y_float < 0.0 || y_float >= (height as f32) ||
+                   s_float < 0.0 || s_float >= dog_scales as f32 {
+                    return None;
+                }
+
+                // 计算在极值点的函数值（使用完整的二阶泰勒展开）
+                let dx_val = current[[y_int, x_int + 1]] - current[[y_int, x_int - 1]];
+                let dy_val = current[[y_int + 1, x_int]] - current[[y_int - 1, x_int]];
+                let ds_val = next[[y_int, x_int]] - prev[[y_int, x_int]];
+                
+                let d_vector = Vector3::new(dx_val, dy_val, ds_val);
+                let offset_vector = Vector3::new(offset[0], offset[1], offset[2]);
+                
+                let dog_value = current[[y_int, x_int]] + 0.5 * d_vector.dot(&offset_vector);
+                
+                // 返回相对于当前点的偏移量
+                return Some((delta[0], delta[1], delta[2], dog_value));
             }
-            iter += 1;
         }
-
-        // 最终偏移量检查
-        if xi[0] > MAX_SHIFT || xi[1] > MAX_SHIFT || xi[2] > 1.0 {
-            return None;
-        }
-
-        // 计算调整后的极值强度
-        let d = samples[[1, 1, 1]] + 0.5 * grad.dot(&xi);
-        Some((xi[0], xi[1], xi[2], d))
+        None
     }
 
     fn is_edge_response(
@@ -289,6 +318,42 @@ impl SiftDetector {
         let trace = dxx + dyy;
         let det = dxx * dyy - dxy * dxy;
 
+        if det <= 0.0 { return true; }
+
         (trace * trace) / det > (CURVATURE_THRESHOLD + 1.0).powi(2) / CURVATURE_THRESHOLD
+    }
+
+    fn dynamic_image_to_ndarray(&self, img: &DynamicImage) -> Array2<f32> {
+        match img {
+            DynamicImage::ImageLuma8(buffer) => {
+                // 从 ImageBuffer<Luma<u8>, _> 转换
+                let (width, height) = buffer.dimensions();
+                let array = Array2::from_shape_fn((height as usize, width as usize), |(y, x)| {
+                    buffer.get_pixel(x as u32, y as u32)[0] as f32
+                });
+                array
+            }
+            _ => {
+                panic!("Unsupported image format");
+            }
+        }
+    }
+    
+    /// 最近邻插值缩放
+    fn resize_nearest_grayscale_simple(
+        &self,
+        image: &Array2<f32>,
+        new_height: usize,
+        new_width: usize
+    ) -> Array2<f32> {
+        let (src_h, src_w) = image.dim();
+        let scale_y = src_h as f32 / new_height as f32;
+        let scale_x = src_w as f32 / new_width as f32;
+        
+        Array2::from_shape_fn((new_height, new_width), |(y, x)| {
+            let src_y = (y as f32 * scale_y) as usize;
+            let src_x = (x as f32 * scale_x) as usize;
+            image[[src_y.min(src_h - 1), src_x.min(src_w - 1)]]
+        })
     }
 }
